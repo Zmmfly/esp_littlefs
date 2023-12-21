@@ -5,27 +5,39 @@
 #include "esp_idf_version.h"
 #include <stdbool.h>
 #include "esp_partition.h"
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define ESP_LITTLEFS_VERSION_NUMBER "1.11.0"
-#define ESP_LITTLEFS_VERSION_MAJOR 1
-#define ESP_LITTLEFS_VERSION_MINOR 11
+#define ESP_LITTLEFS_VERSION_NUMBER "2.0.0"
+#define ESP_LITTLEFS_VERSION_MAJOR 2
+#define ESP_LITTLEFS_VERSION_MINOR 0
 #define ESP_LITTLEFS_VERSION_PATCH 0
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 2) && CONFIG_VFS_SUPPORT_DIR
 #define ESP_LITTLEFS_ENABLE_FTRUNCATE
 #endif // ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 2)
 
+typedef enum esp_littlefs_media_type
+{
+    ESP_LITTLEFS_MEDIA_PART = 0,    /**< partition */
+    ESP_LITTLEFS_MEDIA_SDMMC,       /**< sdcard */
+}esp_littlefs_media_type;
+
 /**
  *Configuration structure for esp_vfs_littlefs_register.
  */
 typedef struct {
     const char *base_path;            /**< Mounting point. */
+    esp_littlefs_media_type media;    /**< Media type, could be ESP_LITTLEFS_TYPE_* */
     const char *partition_label;      /**< Label of partition to use. */
     const esp_partition_t* partition; /**< partition to use if partition_label is NULL */
+    const sdmmc_host_t* sd_host_conf; /**< sdmmc host conf if use littlefs on sdcard */
+    const void* sd_slot_conf;         /**< sdmmc slot conf */
+    sdmmc_card_t** sdcard;            /**< sdcard instance output */
     uint8_t format_if_mount_failed:1; /**< Format the file system if it fails to mount. */
     uint8_t read_only : 1;            /**< Mount the partition as read-only. */
     uint8_t dont_mount:1;             /**< Don't attempt to mount.*/
@@ -69,6 +81,17 @@ esp_err_t esp_vfs_littlefs_unregister(const char* partition_label);
 esp_err_t esp_vfs_littlefs_unregister_partition(const esp_partition_t* partition);
 
 /**
+ * Unregister and unmount sd littlefs from VFS
+ * 
+ * @param card sdcard to unregister
+ * 
+ * @return 
+ *          - ESP_OK if success
+ *          - ESP_ERR_INVALID_STATE already unregistered
+ */
+esp_err_t esp_vfs_littlefs_unregister_sdmmc(sdmmc_card_t* card);
+
+/**
  * Check if littlefs is mounted
  *
  * @param partition_label  Label of the partition to check.
@@ -91,6 +114,16 @@ bool esp_littlefs_mounted(const char* partition_label);
 bool esp_littlefs_partition_mounted(const esp_partition_t* partition);
 
 /**
+ * Check if sd littlefs is mounted
+ * 
+ * @param card sdcard to check
+ * @return
+ *          - true   if mounted
+ *          - false  if not mounted
+ */
+bool esp_littlefs_sdmmc_mounted(sdmmc_card_t* card);
+
+/**
  * Format the littlefs partition
  *
  * @param partition_label  Label of the partition to format.
@@ -109,6 +142,8 @@ esp_err_t esp_littlefs_format(const char* partition_label);
  *          - ESP_FAIL    on error
  */
 esp_err_t esp_littlefs_format_partition(const esp_partition_t* partition);
+
+esp_err_t esp_littlefs_format_sdmmc(sdmmc_card_t* card);
 
 /**
  * Get information for littlefs

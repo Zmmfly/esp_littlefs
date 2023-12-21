@@ -111,6 +111,7 @@ static void      esp_littlefs_dir_free(vfs_littlefs_dir_t *dir);
 static void      esp_littlefs_take_efs_lock(void);
 static esp_err_t esp_littlefs_init_efs(esp_littlefs_t** efs, const esp_partition_t* partition, bool read_only);
 static esp_err_t esp_littlefs_init(const esp_vfs_littlefs_conf_t* conf);
+static esp_err_t esp_littlefs_init_sdmmc(const esp_vfs_littlefs_conf_t* conf);
 
 static esp_err_t esp_littlefs_by_label(const char* label, int * index);
 static esp_err_t esp_littlefs_by_partition(const esp_partition_t* part, int*index);
@@ -228,9 +229,13 @@ esp_err_t format_from_efs(esp_littlefs_t *efs)
         ESP_LOGV(ESP_LITTLEFS_TAG, "Formatting filesystem");
 
         /* Need to write explicit block_count to cfg */
-        efs->cfg.block_count = efs->partition->size / efs->cfg.block_size;
+        if (efs->media == ESP_LITTLEFS_MEDIA_PART) {
+            efs->cfg.block_count = efs->partition->size / efs->cfg.block_size;
+        }
         res = lfs_format(efs->fs, &efs->cfg);
-        efs->cfg.block_count = 0;
+        if (efs->media == ESP_LITTLEFS_MEDIA_PART) {
+            efs->cfg.block_count = 0;
+        }
 
         if( res != LFS_ERR_OK ) {
             ESP_LOGE(ESP_LITTLEFS_TAG, "Failed to format filesystem");
@@ -316,7 +321,15 @@ esp_err_t esp_vfs_littlefs_register(const esp_vfs_littlefs_conf_t * conf)
     assert(conf->base_path);
     const esp_vfs_t vfs = vfs_littlefs_create_struct(!conf->read_only);
 
-    esp_err_t err = esp_littlefs_init(conf);
+    esp_err_t err = ESP_FAIL;
+    if (conf->media == ESP_LITTLEFS_MEDIA_PART) {
+        err = esp_littlefs_init(conf);
+    } else if (conf->media == ESP_LITTLEFS_MEDIA_SDMMC) {
+        err = esp_littlefs_init_sdmmc(conf);
+    } else {
+        ESP_LOGE(ESP_LITTLEFS_TAG, "Unknown media type");
+        return err;
+    }
     if (err != ESP_OK) {
         ESP_LOGE(ESP_LITTLEFS_TAG, "Failed to initialize LittleFS");
         return err;
@@ -468,6 +481,50 @@ exit:
     return err;
 }
 
+static esp_err_t esp_littlefs_by_base_path(const char* path, int* idx)
+{
+    esp_littlefs_t* p = NULL;
+    if (!path || !idx) return ESP_ERR_INVALID_ARG;
+    ESP_LOGV(ESP_LITTLEFS_TAG, "Searching for existing filesystem for card");
+    for (int i = 0; i < CONFIG_LITTLEFS_MAX_PARTITIONS; i++)
+    {
+        p = _efs[i];
+        if (!p || strcmp(path, p->base_path)) continue;
+        *idx = i;
+        ESP_LOGV(ESP_LITTLEFS_TAG, "Found existing filesystem \"%s\" at index %d", path, *idx);
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t esp_littlefs_format_by_base_path(const char* path)
+{
+    assert(path);
+    bool            was_mounted = false;
+    bool            efs_free    = false;
+    int             idx         = -1;
+    int             res         = 0;
+    esp_err_t       err         = ESP_ERR_INVALID_STATE;
+    esp_littlefs_t* efs         = NULL;
+
+    do {
+        /* find index with path */
+        err = esp_littlefs_by_base_path(path, &idx);
+        if (err != ESP_OK) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "cannot find littlefs on path: \"%s\"", path);
+            break;
+        }
+        efs = _efs[idx];
+        assert( efs );
+        ESP_LOGI(ESP_LITTLEFS_TAG, "Formatting \"%s\"", path);
+
+        /* format */
+        ESP_LOGV(ESP_LITTLEFS_TAG, "Formatting filesystem");
+        err = format_from_efs(efs);
+    } while(0);
+    return err;
+}
+
 /********************
  * Static Functions *
  ********************/
@@ -570,6 +627,10 @@ static void esp_littlefs_free(esp_littlefs_t ** efs)
         if(e->cache_size > 0) lfs_unmount(e->fs);
         free(e->fs);
     }
+
+    /* Release sdcard after fs release */
+    if (e->card) free(e->card);
+
     if(e->lock) vSemaphoreDelete(e->lock);
     esp_littlefs_free_fds(e);
     free(e);
@@ -750,6 +811,81 @@ static esp_err_t esp_littlefs_init_efs(esp_littlefs_t** efs, const esp_partition
 }
 
 /**
+ * @brief Allocate sdmmc context
+ * 
+ * @param efs 
+ * @return esp_err_t 
+ */
+static esp_err_t esp_littlefs_sdmmc_allocate(esp_littlefs_t** efs)
+{
+    esp_err_t ec = ESP_ERR_NO_MEM;
+    do {
+        /* Allocate context */
+        *efs = (esp_littlefs_t*)esp_littlefs_calloc(1, sizeof(esp_littlefs_t));
+        if (!*efs)  {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "cannot allocate esp_littlefs context");
+            break;
+        }
+
+        /* Allocate sdcard context */
+        (*efs)->card = (sdmmc_card_t*)esp_littlefs_calloc(1, sizeof(sdmmc_card_t));
+        if (!(*efs)->card) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "cannot allocate sdmmc_card_t instance");
+            break;
+        }
+
+        ec = ESP_OK;
+    }while(0);
+    if (ec == ESP_OK || !(*efs)) return ec;
+
+    /* release resource */
+    if ( (*efs)->card ) free((*efs)->card);
+    free( *efs );
+    *efs = NULL;
+    return ec;
+}
+
+/**
+ * @brief Initialize api and sdcard info
+ * 
+ * @param efs 
+ * @return esp_err_t 
+ */
+esp_err_t esp_littlefs_init_efs_sdmmc(esp_littlefs_t* efs, bool read_only)
+{
+    efs->cfg.context = efs;
+    efs->read_only   = read_only;
+    efs->cfg.read    = littlefs_api_read;
+    efs->cfg.prog    = littlefs_api_prog;
+    efs->cfg.erase   = littlefs_api_erase;
+    efs->cfg.sync    = littlefs_api_sync;
+
+    /* assign parameters */
+    efs->cfg.read_size      = efs->card->csd.sector_size;
+    efs->cfg.prog_size      = efs->card->csd.sector_size;
+    efs->cfg.block_size     = CONFIG_LITTLEFS_BLOCK_SIZE;
+    efs->cfg.block_count    = ((efs->card->csd.capacity * efs->card->csd.sector_size) / CONFIG_LITTLEFS_BLOCK_SIZE);
+    efs->cfg.cache_size     = CONFIG_LITTLEFS_CACHE_SIZE;
+    efs->cfg.lookahead_size = CONFIG_LITTLEFS_LOOKAHEAD_SIZE;
+    efs->cfg.block_cycles   = CONFIG_LITTLEFS_BLOCK_CYCLES;
+
+    /* create lock */
+    efs->lock = xSemaphoreCreateRecursiveMutex();
+    if (!efs->lock) {
+        ESP_LOGE(ESP_LITTLEFS_TAG, "mutex lock could not be created");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* create lfs_t */
+    efs->fs = esp_littlefs_calloc(1, sizeof(lfs_t));
+    if (!efs->fs) {
+        ESP_LOGE(ESP_LITTLEFS_TAG, "littlefs could not be malloced");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/**
  * @brief Initialize and mount littlefs 
  * @param[in] conf Filesystem Configuration
  * @return ESP_OK on success
@@ -862,6 +998,96 @@ exit:
             esp_littlefs_free(&efs);
         }
     }
+    xSemaphoreGive(_efs_lock);
+    return err;
+}
+
+static esp_err_t esp_littlefs_init_sdmmc(const esp_vfs_littlefs_conf_t* conf)
+{
+    int             res = 0;
+    int             idx = -1;
+    esp_err_t       err = ESP_FAIL;
+    esp_littlefs_t* efs = NULL;
+
+    esp_littlefs_take_efs_lock();
+    do {
+        /* Get empty instance index */
+        if (esp_littlefs_get_empty(&idx) != ESP_OK) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "max mounted littlefs reached");
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        /* Allocate sdmmc context */
+        if ((err = esp_littlefs_sdmmc_allocate(&efs)) != ESP_OK) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "cannot allocate sdmmc context");
+            break;
+        }
+        efs->media = conf->media;
+        strlcat(efs->base_path, conf->base_path, ESP_VFS_PATH_MAX);
+
+        /* Initialize sdmmc */
+        sdmmc_host_init();
+        err = sdmmc_host_init_slot(conf->sd_host_conf->slot, conf->sd_slot_conf);
+        if ( err != ESP_OK ) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "sdmmc initialize fail");
+            break;
+        }
+
+        /* Initialize card */
+        err = sdmmc_card_init(conf->sd_host_conf, efs->card);
+        if (err != ESP_OK) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "sdcard init failed, err: %d", err);
+            break;
+        }
+
+        /* Initialize API */
+        err = esp_littlefs_init_efs_sdmmc(efs, conf->read_only);
+        if (err != ESP_OK) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "sdcard api initialize fail: %d", err);
+            break;
+        }
+
+        /* Assign context */
+        _efs[idx] = efs;
+
+        /* break if not need mount */
+        if (conf->dont_mount) break;
+
+        /* Mount */
+        res = lfs_mount(efs->fs, &efs->cfg);
+        if (conf->format_if_mount_failed && res != LFS_ERR_OK) {
+            ESP_LOGW(ESP_LITTLEFS_TAG, "mount fail, %s (%i). formatting...", 
+                esp_littlefs_errno(res), res);
+            
+            /* format when enabled */
+            err = esp_littlefs_format_by_base_path(efs->base_path);
+            if (err != ESP_OK) {
+                ESP_LOGE(ESP_LITTLEFS_TAG, "format failed");
+                break;
+            }
+            res = lfs_mount(efs->fs, &efs->cfg);
+        }
+
+        /* check mount result */
+        if (res != LFS_ERR_OK) {
+            ESP_LOGE(ESP_LITTLEFS_TAG, "mount failed, %s (%i)", esp_littlefs_errno(res), res);
+            err = ESP_FAIL;
+            break;
+        }
+
+        /* allocate cache */
+        efs->cache_size = 4;
+        efs->cache = esp_littlefs_calloc(efs->cache_size, sizeof(*efs->cache));
+
+        // TODO implement fs grow
+
+        /* output sdcard */
+        if (conf->sdcard) *conf->sdcard = efs->card;
+
+        err = ESP_OK;
+    }while(0);
+    if (err != ESP_OK) esp_littlefs_free((idx >= 0) ? &_efs[idx] : &efs);
     xSemaphoreGive(_efs_lock);
     return err;
 }

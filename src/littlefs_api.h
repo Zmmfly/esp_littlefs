@@ -9,6 +9,7 @@
 #include "esp_vfs.h"
 #include "esp_partition.h"
 #include "littlefs/lfs.h"
+#include "driver/sdmmc_host.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,8 @@ typedef struct {
     lfs_t *fs;                                /*!< Handle to the underlying littlefs */
     SemaphoreHandle_t lock;                   /*!< FS lock */
     const esp_partition_t* partition;         /*!< The partition on which littlefs is located */
+    sdmmc_card_t* card;                       /*!< The sdcard instance */
+    int media;                                /*!< Media type, 0 for parition, 1 for sdmmc */
     char base_path[ESP_VFS_PATH_MAX+1];       /*!< Mount point */
 
     struct lfs_config cfg;                    /*!< littlefs Mount configuration */
